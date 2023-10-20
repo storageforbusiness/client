@@ -1,8 +1,8 @@
 package client
 
 import (
+	"bytes"
 	"io"
-	"io/ioutil"
 	"strings"
 
 	goerr "errors"
@@ -58,12 +58,95 @@ func (c *client) PutLink(oldName, linkName upspin.PathName) (*upspin.DirEntry, e
 
 // Put implements upspin.Client.
 func (c *client) Put(name upspin.PathName, data []byte) (*upspin.DirEntry, error) {
-	return c.c.PutSequenced(name, upspin.SeqIgnore, data)
+	return c.PutSequenced(name, upspin.SeqIgnore, data)
 }
 
 // PutSequenced implements upspin.Client.
 func (c *client) PutSequenced(name upspin.PathName, seq int64, data []byte) (*upspin.DirEntry, error) {
-	return c.c.PutSequenced(name, seq, data)
+	const op errors.Op = "client.Put"
+	m, s := newMetric(op)
+	defer m.Done()
+
+	parsed, err := path.Parse(name)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	// Find the Access file that applies. This will also cause us to evaluate links in the path,
+	// and if we do, evalEntry will contain the true file name of the Put operation we will do.
+	accessEntry, evalEntry, err := c.lookup(op, &upspin.DirEntry{Name: parsed.Path()}, whichAccessLookupFn, followFinalLink, s)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+	name = evalEntry.Name
+	readers, err := c.getReaders(op, name, accessEntry)
+	if err != nil {
+		return nil, errors.E(op, name, err)
+	}
+
+	// Encrypt data according to the preferred packer
+	packer := pack.Lookup(c.config.Packing())
+	if packer == nil {
+		return nil, errors.E(op, name, errors.Errorf("unrecognized Packing %d", c.config.Packing()))
+	}
+
+	// Ensure Access file is valid.
+	if access.IsAccessFile(name) {
+		_, err := access.Parse(name, data)
+		if err != nil {
+			return nil, errors.E(op, name, err)
+		}
+	}
+	// Ensure Group file is valid.
+	if access.IsGroupFile(name) {
+		_, err := access.ParseGroup(parsed, data)
+		if err != nil {
+			return nil, errors.E(op, name, err)
+		}
+	}
+
+	entry := &upspin.DirEntry{
+		Name:       name,
+		SignedName: name,
+		Packing:    packer.Packing(),
+		Time:       upspin.Now(),
+		Sequence:   seq,
+		Writer:     c.config.UserName(),
+		Link:       "",
+		Attr:       upspin.AttrNone,
+	}
+
+	storeEndpoint, err := c.storeEndpoint(parsed)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+	ss := s.StartSpan("pack")
+	if err := c.pack(entry, bytes.NewBuffer(data), packer, ss, storeEndpoint); err != nil {
+		return nil, errors.E(op, err)
+	}
+	ss.End()
+	ss = s.StartSpan("addReaders")
+	if err := c.addReaders(op, entry, packer, readers); err != nil {
+		return nil, err
+	}
+	ss.End()
+
+	// We have evaluated links so can use DirServer.Put directly.
+	dir, err := c.DirServer(name)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+
+	defer s.StartSpan("dir.Put").End()
+	e, err := dir.Put(entry)
+	if err != nil {
+		return e, err
+	}
+	// dir.Put returns an incomplete entry, with the updated sequence number.
+	if e != nil { // TODO: Can be nil only when talking to old servers.
+		entry.Sequence = e.Sequence
+	}
+	return entry, nil
 }
 
 // PutSequenced implements upspin.Client.
@@ -84,7 +167,7 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 		return nil, errors.E(op, err)
 	}
 	name = evalEntry.Name
-	readers, err := c.getReaders(name, accessEntry)
+	readers, err := c.getReaders(op, name, accessEntry)
 	if err != nil {
 		return nil, errors.E(op, name, err)
 	}
@@ -97,7 +180,7 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 
 	// Ensure Access file is valid.
 	if access.IsAccessFile(name) {
-		data, e := ioutil.ReadAll(r)
+		data, e := io.ReadAll(r)
 		if e != nil {
 			return nil, errors.E(op, name, e)
 		}
@@ -108,7 +191,7 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 	}
 	// Ensure Group file is valid.
 	if access.IsGroupFile(name) {
-		data, e := ioutil.ReadAll(r)
+		data, e := io.ReadAll(r)
 		if e != nil {
 			return nil, errors.E(op, name, e)
 		}
@@ -129,8 +212,12 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 		Attr:       upspin.AttrNone,
 	}
 
+	storeEndpoint, err := c.storeEndpoint(parsed)
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
 	ss := s.StartSpan("pack")
-	if e := c.pack(entry, r, packer, ss); e != nil {
+	if e := c.pack(entry, r, packer, ss, storeEndpoint); e != nil {
 		return nil, errors.E(op, e)
 	}
 	ss.End()
@@ -158,14 +245,31 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 	return entry, nil
 }
 
-func (c *client) pack(entry *upspin.DirEntry, r io.Reader, packer upspin.Packer, s *metric.Span) error {
+func (c *client) storeEndpoint(path path.Parsed) (upspin.Endpoint, error) {
+	pathUser := path.User()
+	if c.config.UserName() == pathUser {
+		return c.config.StoreEndpoint(), nil
+	}
+	key, err := bind.KeyServer(c.config, c.config.KeyEndpoint())
+	if err != nil {
+		return c.config.StoreEndpoint(), err
+	}
+	u, err := key.Lookup(pathUser)
+	if err != nil {
+		return c.config.StoreEndpoint(), err
+	}
+	return u.Stores[0], nil
+}
+
+func (c *client) pack(entry *upspin.DirEntry, r io.Reader, packer upspin.Packer, s *metric.Span, storeEndpoint upspin.Endpoint) error {
 	// Verify the blocks aren't too big. This can't happen unless someone's modified
 	// flags.BlockSize underfoot, but protect anyway.
 	if flags.BlockSize > upspin.MaxBlockSize {
 		return errors.Errorf("block size too big: %d > %d", flags.BlockSize, upspin.MaxBlockSize)
 	}
 	// Start the I/O.
-	store, err := bind.StoreServer(c.config, c.config.StoreEndpoint())
+
+	store, err := bind.StoreServer(c.config, storeEndpoint)
 	if err != nil {
 		return err
 	}
@@ -197,7 +301,7 @@ func (c *client) pack(entry *upspin.DirEntry, r io.Reader, packer upspin.Packer,
 		}
 		bp.SetLocation(
 			upspin.Location{
-				Endpoint:  c.config.StoreEndpoint(),
+				Endpoint:  storeEndpoint,
 				Reference: refdata.Reference,
 			},
 		)
@@ -300,7 +404,7 @@ func (c *client) addReaders(op errors.Op, entry *upspin.DirEntry, packer upspin.
 // according to the Access file.
 // If the Access file cannot be read because of lack of permissions,
 // it returns the owner of the file (but only if we are not the owner).
-func (c *client) getReaders(name upspin.PathName, accessEntry *upspin.DirEntry) ([]upspin.UserName, error) {
+func (c *client) getReaders(op errors.Op, name upspin.PathName, accessEntry *upspin.DirEntry) ([]upspin.UserName, error) {
 	if accessEntry == nil {
 		// No Access file present, therefore we must be the owner.
 		return nil, nil
@@ -311,9 +415,9 @@ func (c *client) getReaders(name upspin.PathName, accessEntry *upspin.DirEntry) 
 		// reasons, then we must not have read access and thus
 		// cannot know the list of readers.
 		// Instead, just return the owner as the only reader.
-		parsed, e := path.Parse(name)
-		if e != nil {
-			return nil, e
+		parsed, err := path.Parse(name)
+		if err != nil {
+			return nil, err
 		}
 		owner := parsed.User()
 		if owner == c.config.UserName() {
