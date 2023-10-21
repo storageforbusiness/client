@@ -116,7 +116,7 @@ func (c *client) PutSequenced(name upspin.PathName, seq int64, data []byte) (*up
 		Attr:       upspin.AttrNone,
 	}
 
-	storeEndpoint, err := c.storeEndpoint(parsed)
+	storeEndpoint, err := c.storeEndpoint(name)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
@@ -212,7 +212,7 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 		Attr:       upspin.AttrNone,
 	}
 
-	storeEndpoint, err := c.storeEndpoint(parsed)
+	storeEndpoint, err := c.storeEndpoint(name)
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
@@ -245,8 +245,13 @@ func (c *client) Write(name upspin.PathName, r io.Reader) (*upspin.DirEntry, err
 	return entry, nil
 }
 
-func (c *client) storeEndpoint(path path.Parsed) (upspin.Endpoint, error) {
-	pathUser := path.User()
+func (c *client) storeEndpoint(name upspin.PathName) (upspin.Endpoint, error) {
+	parsed, err := path.Parse(name)
+	if err != nil {
+		// for now we skip the name
+		return c.config.StoreEndpoint(), nil
+	}
+	pathUser := parsed.User()
 	if c.config.UserName() == pathUser {
 		return c.config.StoreEndpoint(), nil
 	}
