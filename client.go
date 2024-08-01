@@ -589,6 +589,11 @@ func (c *client) SetTime(name upspin.PathName, t upspin.Time) error {
 	return c.c.SetTime(name, t)
 }
 
+// SetTimeSequenced implements upspin.Client.
+func (c *client) SetTimeSequenced(name upspin.PathName, seq int64, t upspin.Time) (*upspin.DirEntry, error) {
+	return c.c.SetTimeSequenced(name, upspin.SeqIgnore, t)
+}
+
 func newMetric(op errors.Op) (*metric.Metric, *metric.Span) {
 	m := metric.New("")
 	s := m.StartSpan(op).SetKind(metric.Client)
